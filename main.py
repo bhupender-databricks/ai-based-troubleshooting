@@ -1,71 +1,109 @@
-from langchain.agents import create_csv_agent
-from langchain.agents.agent_types import AgentType
-from langchain.llms import OpenAI
-from dotenv import load_dotenv
-import os
-import csv
-import re
 import streamlit as st
+from dotenv import load_dotenv
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chat_models import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import ConversationalRetrievalChain
+from htmlTemplates import css, bot_template, user_template
+import os
+import sys
 
-
-def convert_log_to_csv_and_store(dir_path, csv_file_prefix, csv_dir_path):
-    for root, dirs, files in os.walk(dir_path):
+sys.path.append("./env/lib/python3.11/site-packages")
+def get_log_text(log_docs):
+    text = ''
+    for root, dirs, files in os.walk(log_docs):
         for file in files:
             if file.endswith('.log'):
                 with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
                     lines = f.readlines()
-                    with open(os.path.join(csv_dir_path, csv_file_prefix + '_' + file.split('.')[0] + '.csv'), 'w', newline='', encoding='utf-8') as csvfile:
-                        writer = csv.writer(csvfile, delimiter=',')
-                        for line in lines:
-                            line = line.strip()
-                            if line:
-                                line = re.sub(',', '","', line)
-                                line = '"' + line + '"'
-                                writer.writerow([line])
+                    text += ''.join(lines)
+    print(text)
+    return text
+
+
+def get_text_chunks(text):
+    text_splitter = CharacterTextSplitter(
+        separator="\n",
+        chunk_size=1000,
+        chunk_overlap=100,
+        length_function=len
+    )
+    chunks = text_splitter.split_text(text)
+    return chunks
+
+
+def get_vectorstore(text_chunks):
+    embeddings = OpenAIEmbeddings()
+    # embeddings = HuggingFaceInstructEmbeddings(model_name="hkunlp/instructor-xl")
+    vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
+    return vectorstore
+
+
+def get_conversation_chain(vectorstore):
+    llm = ChatOpenAI(verbose=True)
+    # llm = HuggingFaceHub(repo_id="google/flan-t5-xxl", model_kwargs={"temperature":0.5, "max_length":512})
+
+    memory = ConversationBufferMemory(
+        memory_key='chat_history', return_messages=True)
+    conversation_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=vectorstore.as_retriever(),
+        memory=memory
+    )
+    return conversation_chain
+
+
+def handle_userinput(user_question):
+    response = st.session_state.conversation({'question': user_question})
+    st.session_state.chat_history = response['chat_history']
+
+    for i, message in enumerate(st.session_state.chat_history):
+        if i % 2 == 0:
+            st.write(user_template.replace(
+                "{{MSG}}", message.content), unsafe_allow_html=True)
+        else:
+            st.write(bot_template.replace(
+                "{{MSG}}", message.content), unsafe_allow_html=True)
+
 
 def main():
     load_dotenv()
+    st.set_page_config(page_title="Chat with multiple PDFs",
+                       page_icon=":books:")
+    st.write(css, unsafe_allow_html=True)
 
-    # Load the OpenAI API key from the environment variable
-    if os.getenv("OPENAI_API_KEY") is None or os.getenv("OPENAI_API_KEY") == "":
-        print("OPENAI_API_KEY is not set")
-        exit(1)
-    else:
-        print("OPENAI_API_KEY is set")
+    if "conversation" not in st.session_state:
+        st.session_state.conversation = None
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = None
 
-    st.set_page_config(page_title="AI based Troubleshooting platform")
-    st.header("AI based Troubleshooting platform")
+    st.header("Chat with multiple Log files :books:")
+    user_question = st.text_input("Ask a question about your log documents:")
+    if user_question:
+        handle_userinput(user_question)
 
-    # filenames = []
-    # for root,dirs, files in os.walk('./csv'):
-    #     for file in files:
-    #         if file.endswith('csv'):
-    #             filenames.append(os.path.join(root, file))
-    # print(filenames)
+    with st.sidebar:
+        st.subheader("Provide the path to your log documents")
+        log_docs = st.text_input("")
+        # log_docs = st.file_uploader(
+        #     "Upload your Log files here and click on 'Process'", accept_multiple_files=True)
+        if st.button("Process"):
+            with st.spinner("Processing"):
+                # get pdf text
+                raw_text = get_log_text(log_docs)
 
-    csv_file = ['./csv/main_Apache_2k.csv', './csv/main_HPC_2k.csv', './csv/main_BGL_2k.csv', './csv/main_SSH_2k.csv', './csv/main_Mac_2k.csv']
+                # get the text chunks
+                text_chunks = get_text_chunks(raw_text)
 
-    if csv_file is not None:
+                # create vector store
+                vectorstore = get_vectorstore(text_chunks)
 
-        agent = create_csv_agent(
-            OpenAI(temperature=0),
-            csv_file,
-            verbose=True,
-            agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-            max_execution_time=100,
-            early_stopping_method="generate",
-        )
-
-        user_question = st.text_input("Ask a question to your troubleshooting bot:")
-
-        if user_question is not None and user_question != "":
-            with st.spinner(text="In progress..."):
-                st.write(agent.run(user_question))
+                # create conversation chain
+                st.session_state.conversation = get_conversation_chain(
+                    vectorstore)
 
 
-if __name__ == "__main__":
-    dir_path = './loghub'
-    csv_file_prefix = 'main'
-    csv_dir_path = './csv'
-    convert_log_to_csv_and_store(dir_path, csv_file_prefix, csv_dir_path)
+if __name__ == '__main__':
     main()
